@@ -87,27 +87,73 @@ def fetch_weather():
         import requests
         r = requests.get("https://api.open-meteo.com/v1/forecast", params={
             "latitude": NOOSA_LAT, "longitude": NOOSA_LON,
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,weathercode,windspeed_10m_max",
+            "daily": ("temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
+                      "precipitation_sum,weathercode,windspeed_10m_max,windgusts_10m_max,"
+                      "winddirection_10m_dominant,sunrise,sunset,uv_index_max"),
+            "hourly": ("temperature_2m,apparent_temperature,precipitation_probability,"
+                       "precipitation,windspeed_10m,winddirection_10m,"
+                       "relative_humidity_2m,cloudcover,uv_index"),
             "timezone": "Australia/Brisbane",
-            "start_date": "2026-06-08", "end_date": "2026-06-16"}, timeout=15)
-        dd = r.json().get("daily", {})
+            "start_date": "2026-06-08", "end_date": "2026-06-16"
+        }, timeout=20)
+        data = r.json()
+        dd = data.get("daily", {})
+        hd = data.get("hourly", {})
         if not dd:
-            return {}
-        result = {}
-        for i, iso in enumerate(dd["time"]):
-            result[iso] = {
-                "max":  dd["temperature_2m_max"][i],
-                "min":  dd["temperature_2m_min"][i],
-                "rain": dd["precipitation_probability_max"][i] or 0,
-                "mm":   dd["precipitation_sum"][i] or 0,
-                "code": dd["weathercode"][i],
-                "wind": dd["windspeed_10m_max"][i],
+            return {}, {}
+
+        def dv(key, i):
+            a = dd.get(key, [])
+            return a[i] if i < len(a) else None
+
+        daily = {}
+        for i, iso in enumerate(dd.get("time", [])):
+            daily[iso] = {
+                "max":     dv("temperature_2m_max", i),
+                "min":     dv("temperature_2m_min", i),
+                "rain":    dv("precipitation_probability_max", i) or 0,
+                "mm":      dv("precipitation_sum", i) or 0,
+                "code":    dv("weathercode", i) or 0,
+                "wind":    dv("windspeed_10m_max", i) or 0,
+                "gusts":   dv("windgusts_10m_max", i) or 0,
+                "winddir": dv("winddirection_10m_dominant", i) or 0,
+                "sunrise": dv("sunrise", i) or "",
+                "sunset":  dv("sunset",  i) or "",
+                "uv_max":  dv("uv_index_max", i) or 0,
             }
-        print(f"  Weather: fetched {len(result)} days OK.")
-        return result
+
+        hourly = {}
+        for i, ts in enumerate(hd.get("time", [])):
+            day_iso = ts[:10]
+            hour = int(ts[11:13])
+            if 6 <= hour <= 23 and day_iso in daily:
+                def hv(key, fallback=0):
+                    a = hd.get(key, [])
+                    v = a[i] if i < len(a) else None
+                    return v if v is not None else fallback
+                hourly.setdefault(day_iso, []).append({
+                    "hour":          hour,
+                    "temp":          hv("temperature_2m", None),
+                    "apparent_temp": hv("apparent_temperature", None),
+                    "prob":          int(hv("precipitation_probability")),
+                    "precip":        hv("precipitation"),
+                    "windspeed":     hv("windspeed_10m"),
+                    "winddir":       hv("winddirection_10m"),
+                    "humidity":      hv("relative_humidity_2m"),
+                    "cloud":         hv("cloudcover"),
+                    "uv":            hv("uv_index"),
+                })
+
+        for iso, hrs in hourly.items():
+            hum = [h["humidity"] for h in hrs if h["humidity"]]
+            if hum:
+                daily[iso]["humidity"] = round(max(hum))
+
+        print(f"  Weather: fetched {len(daily)} days OK.")
+        return daily, hourly
     except Exception as ex:
         print(f"  Warning: weather fetch failed ({ex}). Sections will show placeholder.")
-        return {}
+        return {}, {}
 
 def fetch_metvuw_maps(days_meta):
     """Download Metvuw QLD rainfall maps at generation time; return {iso: data_uri or None}."""
@@ -164,7 +210,170 @@ def fetch_metvuw_maps(days_meta):
     print(f"  Maps: {fetched}/{len(days_meta)} Metvuw images embedded.")
     return maps
 
-# ── HTML HELPERS ───────────────���──────────────────────────────────────────────
+# ── WEATHER HELPERS ───────────────────────────────────────────────────────────
+def wind_dir_label(deg):
+    dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
+    return dirs[int((float(deg) + 11.25) / 22.5) % 16]
+
+def uv_label_color(uv):
+    uv = uv or 0
+    if uv < 3:  return 'Low',       '#22c55e'
+    if uv < 6:  return 'Moderate',  '#eab308'
+    if uv < 8:  return 'High',      '#f97316'
+    if uv < 11: return 'Very High', '#ef4444'
+    return 'Extreme', '#9333ea'
+
+def fmt_sunrise(ts):
+    try:
+        t = dt.strptime(ts[-5:], '%H:%M')
+        return t.strftime('%I:%M%p').lstrip('0').lower()
+    except Exception:
+        return ts
+
+def rain_advisory(hourly):
+    if not hourly:
+        return 'green', ''
+    max_prob  = max(h['prob'] for h in hourly)
+    total_mm  = sum(h['precip'] for h in hourly)
+    windows   = []
+    start = None
+    for h in hourly:
+        if h['prob'] >= 40 and start is None:
+            start = h['hour']
+        elif h['prob'] < 40 and start is not None:
+            windows.append((start, h['hour']))
+            start = None
+    if start is not None:
+        windows.append((start, hourly[-1]['hour'] + 1))
+
+    def fh(h):
+        if h == 12: return '12pm'
+        return (f'{h-12}pm' if h > 12 else f'{h}am')
+
+    if max_prob >= 70 or total_mm >= 5:
+        level = 'red'
+        win   = f' ({fh(windows[0][0])}–{fh(windows[0][1])})' if windows else ''
+        msg   = f'High rain risk{win}. {total_mm:.1f}mm possible. Have contingency ready.'
+    elif max_prob >= 40:
+        level = 'orange'
+        win   = f' {fh(windows[0][0])}–{fh(windows[0][1])}' if windows else ''
+        msg   = f'Rain possible{win}. Monitor conditions.'
+    else:
+        level = 'green'
+        msg   = 'Dry conditions expected.'
+    return level, msg
+
+def render_hourly_chart(hourly):
+    if not hourly:
+        return ''
+    W, HC, HL = 720, 100, 22
+    PL, PR    = 6, 6
+    CW        = W - PL - PR
+    n         = len(hourly)
+    cw        = CW / n
+
+    probs  = [h['prob']   for h in hourly]
+    precip = [h['precip'] for h in hourly]
+    temps  = [h.get('temp') for h in hourly]
+
+    max_p  = max(max(precip) if precip else 0, 2)
+    vt     = [t for t in temps if t is not None]
+    t_lo   = (min(vt) - 2) if vt else 10
+    t_hi   = (max(vt) + 2) if vt else 35
+    t_rng  = max(t_hi - t_lo, 4)
+
+    def xc(i):   return PL + (i + 0.5) * cw
+    def yp(p):   return HC * (1.0 - p / 100.0 * 0.88)
+    def ymm(mm): return HC * (1.0 - min(mm, max_p) / max_p * 0.65)
+    def yt(t):   return HC * (0.08 + (1 - (t - t_lo) / t_rng) * 0.55)
+
+    def smooth(pts):
+        d = f'M {pts[0][0]:.1f},{pts[0][1]:.1f}'
+        for k in range(1, len(pts)):
+            x0, y0 = pts[k-1]; x1, y1 = pts[k]
+            cx = (x0 + x1) / 2
+            d += f' C {cx:.1f},{y0:.1f} {cx:.1f},{y1:.1f} {x1:.1f},{y1:.1f}'
+        return d
+
+    o = []
+    o.append(f'<svg viewBox="0 0 {W} {HC+HL}" xmlns="http://www.w3.org/2000/svg" style="width:100%;display:block">')
+    o.append('<defs>'
+             '<linearGradient id="wxpg" x1="0" y1="0" x2="0" y2="1">'
+             '<stop offset="0%" stop-color="#1a9bc6" stop-opacity="0.45"/>'
+             '<stop offset="100%" stop-color="#1a9bc6" stop-opacity="0.04"/>'
+             '</linearGradient>'
+             '<linearGradient id="wxbg" x1="0" y1="0" x2="0" y2="1">'
+             '<stop offset="0%" stop-color="#0c4a6e"/>'
+             '<stop offset="100%" stop-color="#0369a1"/>'
+             '</linearGradient>'
+             '</defs>')
+    o.append(f'<rect x="{PL}" y="0" width="{CW}" height="{HC}" fill="rgba(213,240,254,0.18)" rx="4"/>')
+
+    for pct in [25, 50, 75]:
+        gy  = yp(pct)
+        col = 'rgba(8,32,56,0.12)' if pct == 50 else 'rgba(8,32,56,0.06)'
+        o.append(f'<line x1="{PL}" y1="{gy:.1f}" x2="{W-PR}" y2="{gy:.1f}" stroke="{col}" stroke-width="1"/>')
+        o.append(f'<text x="{PL+3}" y="{gy-2:.1f}" font-size="8" fill="rgba(8,32,56,0.28)" font-family="DM Sans,sans-serif">{pct}%</text>')
+
+    # Probability area
+    pts = [(xc(i), yp(probs[i])) for i in range(n)]
+    area_d = smooth(pts) + f' L {pts[-1][0]:.1f},{HC} L {PL},{HC} Z'
+    o.append(f'<path d="{area_d}" fill="url(#wxpg)"/>')
+    o.append(f'<path d="{smooth(pts)}" fill="none" stroke="#1a9bc6" stroke-width="1.5" stroke-linejoin="round"/>')
+
+    # Precipitation bars
+    bw = cw * 0.42
+    for i, h in enumerate(hourly):
+        if h['precip'] >= 0.1:
+            bt  = ymm(h['precip'])
+            bh  = HC - bt
+            bx  = xc(i) - bw / 2
+            o.append(f'<rect x="{bx:.1f}" y="{bt:.1f}" width="{bw:.1f}" height="{bh:.1f}" fill="url(#wxbg)" rx="1.5" opacity="0.85"/>')
+            if h['precip'] >= 0.4:
+                lv = h['precip']
+                o.append(f'<text x="{xc(i):.1f}" y="{bt-2.5:.1f}" text-anchor="middle" font-size="7.5" fill="#0c4a6e" font-weight="700" font-family="DM Sans,sans-serif">{lv:.1f}</text>')
+
+    # Temperature line
+    tpts = [(xc(i), yt(t)) for i, t in enumerate(temps) if t is not None]
+    if len(tpts) > 1:
+        o.append(f'<path d="{smooth(tpts)}" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round"/>')
+        for j, (px, py) in enumerate(tpts):
+            if j % 3 == 0:
+                o.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2.5" fill="#f97316" stroke="white" stroke-width="1"/>')
+                tv = temps[[k for k, t in enumerate(temps) if t is not None][j]]
+                o.append(f'<text x="{px:.1f}" y="{py-5:.1f}" text-anchor="middle" font-size="8" fill="#ea580c" font-weight="600" font-family="DM Sans,sans-serif">{round(tv)}°</text>')
+
+    # Time labels
+    for i, h in enumerate(hourly):
+        hr = h['hour']
+        if hr in [6, 9, 12, 15, 18, 21]:
+            lx  = xc(i)
+            lbl = '12pm' if hr == 12 else (f'{hr-12}pm' if hr > 12 else f'{hr}am')
+            o.append(f'<line x1="{lx:.1f}" y1="0" x2="{lx:.1f}" y2="{HC}" stroke="rgba(8,32,56,0.05)" stroke-width="1"/>')
+            o.append(f'<line x1="{lx:.1f}" y1="{HC}" x2="{lx:.1f}" y2="{HC+4}" stroke="rgba(8,32,56,0.25)" stroke-width="1"/>')
+            o.append(f'<text x="{lx:.1f}" y="{HC+15}" text-anchor="middle" font-size="9" fill="rgba(8,32,56,0.5)" font-family="DM Sans,sans-serif">{lbl}</text>')
+
+    # Peak probability callout
+    mp = max(probs)
+    if mp >= 20:
+        mpi = probs.index(mp)
+        px, py = xc(mpi), yp(mp)
+        o.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" fill="#1a9bc6"/>')
+        o.append(f'<text x="{px:.1f}" y="{py-7:.1f}" text-anchor="middle" font-size="9.5" fill="#0c4a6e" font-weight="700" font-family="Outfit,sans-serif">{mp}%</text>')
+
+    # Legend
+    lx0 = PL + 4
+    o.append(f'<rect x="{lx0}" y="5" width="9" height="7" fill="#1a9bc6" opacity="0.45" rx="1"/>')
+    o.append(f'<text x="{lx0+12}" y="12" font-size="7.5" fill="rgba(8,32,56,0.4)" font-family="DM Sans,sans-serif">Rain prob.</text>')
+    o.append(f'<rect x="{lx0+65}" y="5" width="9" height="7" fill="#0c4a6e" opacity="0.85" rx="1"/>')
+    o.append(f'<text x="{lx0+77}" y="12" font-size="7.5" fill="rgba(8,32,56,0.4)" font-family="DM Sans,sans-serif">Precip mm</text>')
+    o.append(f'<line x1="{lx0+140}" y1="8.5" x2="{lx0+152}" y2="8.5" stroke="#f97316" stroke-width="2"/>')
+    o.append(f'<text x="{lx0+155}" y="12" font-size="7.5" fill="rgba(8,32,56,0.4)" font-family="DM Sans,sans-serif">Temp °C</text>')
+
+    o.append('</svg>')
+    return ''.join(o)
+
+# ── HTML HELPERS ──────────────────────────────────────────────────────────────
 def e(v):
     return "" if v is None else html.escape(str(v))
 
@@ -203,37 +412,96 @@ def render_schedule(events):
             '<th>Contact / Company</th><th>Number</th><th>Notes</th></tr></thead>'
             f'<tbody>{body}</tbody></table></div>')
 
-def render_weather(wx, iso, idx, map_b64=None):
+def render_weather(wx, iso, idx, hourly=None):
     if not wx:
-        wbody = '<p class="empty-section">Weather unavailable. Run script with internet access, or add manually to day_notes.json.</p>'
-    else:
-        code = wx.get("code", 0)
-        icon = WMO_ICON.get(code, "")
-        desc = WMO_DESC.get(code, "Variable")
-        max_t = round(wx["max"]); min_t = round(wx["min"])
-        rain = int(wx["rain"]); mm = wx["mm"]; wind = round(wx["wind"])
-        mm_str = f'<span class="rain-mm">{mm:.1f}mm</span>' if mm > 0 else ""
-        wbody = (
-            f'<div class="weather-temps"><span class="temp-min">Min {min_t}&deg;</span>'
-            f'<span class="temp-max">{max_t}</span><span class="temp-unit">&deg;C</span></div>'
-            f'<div class="weather-summary">{icon} {e(desc)}</div>'
-            f'<div class="rain-row">Chance of rain: <strong>{rain}%</strong>'
-            f'<div class="rain-bar"><div class="rain-fill" style="width:{rain}%"></div></div>{mm_str}</div>'
-            f'<div class="weather-extras"><span>Wind: <strong>{wind}&nbsp;km/h</strong></span>'
-            f'<span>Open-Meteo &middot; Noosa Beach &middot; {iso}</span></div>')
-    if map_b64:
-        map_wrap = (
-            f'<div class="weather-map-wrap">'
-            f'<img src="{map_b64}" alt="Rainfall forecast">'
-            f'<div class="map-label">metvuw &middot; QLD Rainfall</div>'
-            f'<div class="map-caption">Queensland rainfall — next day forecast</div></div>')
-    else:
-        map_wrap = ''
+        return '<p class="empty-section">Weather unavailable. Run script with internet access.</p>'
+
+    code    = wx.get("code", 0)
+    icon    = WMO_ICON.get(code, "")
+    desc    = WMO_DESC.get(code, "Variable")
+    max_t   = round(wx["max"])
+    min_t   = round(wx["min"])
+    rain    = int(wx["rain"])
+    total   = wx["mm"]
+    wind    = round(wx["wind"])
+    gusts   = round(wx.get("gusts", 0) or 0)
+    winddir = wx.get("winddir", 0) or 0
+    sunrise = wx.get("sunrise", "")
+    sunset  = wx.get("sunset",  "")
+    uv_max  = wx.get("uv_max",  0) or 0
+    humidity = wx.get("humidity", 0) or 0
+
+    uv_lbl, uv_col = uv_label_color(uv_max)
+    wdir_lbl = wind_dir_label(winddir)
+
+    feels = None
+    if hourly:
+        at = [h.get("apparent_temp") for h in hourly if h.get("apparent_temp") is not None]
+        if at:
+            feels = round(max(at))
+
+    # Advisory bar
+    adv_level, adv_msg = rain_advisory(hourly or [])
+    adv_styles = {
+        'green':  ('background:#dcfce7;color:#14532d;border-left:3px solid #16a34a', '#16a34a'),
+        'orange': ('background:#fff7ed;color:#7c2d12;border-left:3px solid #f97316', '#f97316'),
+        'red':    ('background:#fef2f2;color:#7f1d1d;border-left:3px solid #dc2626', '#dc2626'),
+    }
+    adv_style, adv_dot_col = adv_styles[adv_level]
+
+    # Headline
+    feels_str = f'&nbsp;&nbsp;Feels {feels}&deg;' if feels else ''
+    mm_disp   = f'{total:.1f} mm' if total > 0 else 'No rain'
+    headline  = (
+        f'<div class="wx-headline">'
+        f'<span class="wx-icon">{icon}</span>'
+        f'<div class="wx-desc-wrap">'
+        f'<span class="wx-desc">{e(desc)}</span>'
+        f'<span class="wx-temps"><span class="wx-tmax">&uarr;{max_t}&deg;</span>'
+        f'<span class="wx-tmin">&darr;{min_t}&deg;C</span>{feels_str}</span>'
+        f'</div>'
+        f'<span class="wx-mm-badge">{mm_disp}</span>'
+        f'</div>')
+
+    # Chart
+    chart_html = ''
+    if hourly:
+        chart_html = '<div class="wx-chart-wrap">' + render_hourly_chart(hourly) + '</div>'
+
+    # Advisory
+    adv_html = (
+        f'<div class="wx-advisory" style="{adv_style}">'
+        f'<span class="wx-adv-dot" style="background:{adv_dot_col}"></span>'
+        f'<span>{e(adv_msg)}</span>'
+        f'</div>'
+    )
+
+    # Stats grid
+    def stat(lbl, val):
+        return f'<div class="wx-stat"><div class="wx-stat-lbl">{lbl}</div><div class="wx-stat-val">{val}</div></div>'
+
+    uv_val = f'<span style="color:{uv_col};font-weight:700">{int(uv_max)} &mdash; {uv_lbl}</span>' if uv_max else '&mdash;'
+    stats  = []
+    if sunrise: stats.append(stat('Sunrise',     fmt_sunrise(sunrise)))
+    if sunset:  stats.append(stat('Sunset',      fmt_sunrise(sunset)))
+    if uv_max:  stats.append(stat('UV Index',    uv_val))
+    stats.append(stat('Wind',        f'{wind} km/h <span class="wx-stat-sub">{wdir_lbl}</span>'))
+    if gusts:   stats.append(stat('Gusts',       f'{gusts} km/h'))
+    if humidity: stats.append(stat('Humidity',   f'{int(humidity)}%'))
+    stats.append(stat('Rain Chance', f'{rain}%'))
+    if total > 0: stats.append(stat('Total Rain', f'{total:.1f} mm'))
+    stats.append(stat('Source', 'Open-Meteo &middot; Noosa Beach'))
+
+    stats_html = '<div class="wx-stats">' + ''.join(stats) + '</div>'
+
     return (
-        f'<div class="weather-card">'
-        f'<div class="weather-date-row">{iso}</div>'
-        f'<div class="weather-left">{wbody}</div>'
-        f'{map_wrap}</div>')
+        f'<div class="wx-card">'
+        f'{headline}'
+        f'{chart_html}'
+        f'{adv_html}'
+        f'{stats_html}'
+        f'</div>'
+    )
 
 def render_radios(r):
     if not r: return '<p class="empty-section">Radio assignments not yet set.</p>'
@@ -259,7 +527,7 @@ def sec(heading, content):
     return f'<div class="ds-section"><h2 class="section-heading">{heading}</h2>{content}</div>'
 
 # ── DAY PANEL ─────────────────────────────────────────────────────────────────
-def render_panel(meta, idx, events, notes, weather_by_date, maps_by_date=None):
+def render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date=None):
     iso = meta["iso"]
     wx  = weather_by_date.get(iso)
     n   = notes
@@ -283,8 +551,8 @@ def render_panel(meta, idx, events, notes, weather_by_date, maps_by_date=None):
     if n.get("flags"):     parts.append(sec("Flags",   bullets(n["flags"])))
     parts.append(sec("Schedule", render_schedule(events)))
     parts.append(sec("Before End of Day", bullets(n.get('before_eod'))))
-    map_b64 = (maps_by_date or {}).get(iso)
-    parts.append(sec("Weather",  render_weather(wx, iso, idx, map_b64)))
+    hourly = (hourly_by_date or {}).get(iso)
+    parts.append(sec("Weather",  render_weather(wx, iso, idx, hourly)))
     if n.get("to_sort"):   parts.append(sec("To Sort", bullets(n["to_sort"])))
     if n.get("wifi"):      parts.append(sec("WiFi",    render_wifi(n["wifi"])))
     if n.get("radios"):    parts.append(sec("Radio Assignments / Channels", render_radios(n["radios"])))
@@ -299,7 +567,7 @@ def render_panel(meta, idx, events, notes, weather_by_date, maps_by_date=None):
         f'<div class="day-body">{body}</div></div>')
 
 # ── CSS + JS (embedded in generated HTML) ────────────────────────────────────
-CSS = "\n:root{--blue:#d5f0fe;--blue-light:rgba(213,240,254,.30);--blue-mid:#1a9bc6;--dark:#082038;--text:rgba(0,0,0,.82);--muted:rgba(0,0,0,.45);--white:#fff;--nav-w:220px;--r:10px;--c-event:#F97316;--c-site:#16A34A;--c-tech:#2563EB;--c-vendor:#D97706;--c-security:#DC2626;--c-theming:#7C3AED;--c-crew:#525252}\n*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:'DM Sans',sans-serif;font-size:14px;color:var(--text);background:var(--white);letter-spacing:.003em;line-height:1.55}\n.ticker{position:fixed;top:0;left:var(--nav-w);right:0;z-index:500;padding:10px 48px 10px 20px;display:flex;align-items:center;gap:12px;font-size:13px;font-weight:500;transition:transform .3s ease}\n.ticker.hidden{transform:translateY(-110%)}\n.ticker-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}\n.ticker-close{position:absolute;right:16px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:20px;line-height:1;opacity:.6;padding:4px}\n.ticker-close:hover{opacity:1}\n.ticker.green{background:#dcfce7;color:#14532d;border-bottom:1px solid #86efac}.ticker.green .ticker-dot{background:#16a34a}\n.ticker.orange{background:#fff7ed;color:#7c2d12;border-bottom:1px solid #fdba74}.ticker.orange .ticker-dot{background:#f97316}\n.ticker.red{background:#fef2f2;color:#7f1d1d;border-bottom:1px solid #fca5a5}.ticker.red .ticker-dot{background:#dc2626}\nbody.has-ticker .main{padding-top:42px}\n.sidebar{position:fixed;top:0;left:0;width:var(--nav-w);height:100vh;background:var(--blue);display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;z-index:100;scrollbar-width:none}\n.sidebar::-webkit-scrollbar{display:none}\n.sidebar-logo{padding:22px 18px 14px;flex-shrink:0}\n.sidebar-logo img{width:62px;height:62px;display:block}\n.sidebar-meta{padding:0 18px 16px;border-bottom:1px solid rgba(8,32,56,.12);flex-shrink:0}\n.sidebar-meta .fn{font-family:'Outfit',sans-serif;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dark);line-height:1.3;margin-bottom:2px}\n.sidebar-meta .fs{font-size:11px;color:rgba(8,32,56,.55)}\n.day-nav{list-style:none;padding:10px 0 20px;flex:1}\n.day-nav li a{display:block;padding:9px 18px;text-decoration:none;color:rgba(8,32,56,.7);font-size:12px;font-weight:500;line-height:1.3;transition:background .15s;border-left:3px solid transparent;cursor:pointer}\n.day-nav li a .dn{display:block;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;color:var(--dark);line-height:1.2}\n.day-nav li a .dt{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:rgba(8,32,56,.45)}\n.day-nav li a:hover{background:rgba(8,32,56,.07)}\n.day-nav li a.active{background:rgba(8,32,56,.1);border-left-color:var(--dark)}\n.sidebar-footer{padding:14px 18px;border-top:1px solid rgba(8,32,56,.1);font-size:11px;color:rgba(8,32,56,.45);flex-shrink:0}\n.main{margin-left:var(--nav-w);min-height:100vh}\n.day-panel{display:none}.day-panel.active{display:block}\n.day-header{background:var(--blue);padding:36px 48px 28px;border-bottom:1px solid rgba(8,32,56,.08)}\n.day-header .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:rgba(8,32,56,.5);margin-bottom:6px}\n.day-header h1{font-family:'Outfit',sans-serif;font-size:52px;font-weight:300;letter-spacing:-.03em;color:var(--dark);line-height:1;margin-bottom:6px}\n.day-header .dd{font-family:'Outfit',sans-serif;font-size:18px;font-weight:400;color:rgba(8,32,56,.6);letter-spacing:-.01em}\n.day-body{padding:0 48px 60px}\n.ds-section{padding:32px 0 28px;border-bottom:1px solid rgba(8,32,56,.07)}\n.ds-section:last-child{border-bottom:none}\n.section-heading{font-family:'Outfit',sans-serif;font-size:28px;font-weight:300;color:var(--blue-mid);letter-spacing:-.02em;margin-bottom:16px;line-height:1.1}\n.empty-section{color:var(--muted);font-size:13px;font-style:italic}\n.sitemap-toggle{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;background:var(--blue-light);border:1px solid rgba(8,32,56,.1);border-radius:var(--r);padding:12px 16px;margin-top:16px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--dark);transition:background .2s}\n.sitemap-toggle:hover{background:rgba(213,240,254,.6)}\n.sitemap-arrow{font-size:11px;transition:transform .25s;margin-left:auto;color:var(--muted)}\n.sitemap-toggle.open .sitemap-arrow{transform:rotate(180deg)}\n.sitemap-body{display:none;margin-top:8px;border-radius:var(--r);overflow:hidden;border:1px solid rgba(8,32,56,.1)}\n.sitemap-body.open{display:block}\n.sitemap-body embed{display:block;width:100%;height:72vh;border:none}\n.sitemap-fallback{padding:16px;color:var(--muted);font-size:12px;background:#f8f9fa}\n.bullet-list{list-style:none;display:flex;flex-direction:column;gap:8px}\n.bullet-list li{padding-left:22px;position:relative;font-size:14px;line-height:1.55}\n.bullet-list li::before{content:'';position:absolute;left:0;top:9px;width:8px;height:8px;border:1.5px solid var(--dark);border-radius:50%}\n.schedule-wrap{overflow-x:auto;margin-top:4px}\n.schedule-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:780px}\n.schedule-table thead th{background:var(--dark);color:var(--blue);padding:9px 12px;text-align:left;font-family:'Outfit',sans-serif;font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}\n.schedule-table tbody tr{border-bottom:1px solid rgba(8,32,56,.07)}\n.schedule-table tbody tr:nth-child(even){background:rgba(213,240,254,.18)}\n.schedule-table tbody tr:hover{background:rgba(213,240,254,.35)}\n.schedule-table td{padding:8px 12px;vertical-align:top}\n.td-time{font-family:'Outfit',sans-serif;font-weight:600;font-size:13px;color:var(--dark);white-space:nowrap;width:70px}\n.td-num{white-space:nowrap}\n.td-notes{font-size:11.5px;color:var(--muted);font-style:italic}\n.dept-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;color:white}\n.dept-Event{background:var(--c-event)}.dept-Site{background:var(--c-site)}.dept-Technical{background:var(--c-tech)}\n.dept-Vendor{background:var(--c-vendor)}.dept-Security{background:var(--c-security)}.dept-Theming{background:var(--c-theming)}.dept-Crew{background:var(--c-crew)}\n.weather-card{background:var(--blue-light);border:1px solid rgba(8,32,56,.1);border-radius:var(--r);padding:20px 24px;display:grid;grid-template-columns:1fr auto;gap:16px 24px}\n.weather-date-row{grid-column:1/-1;font-family:'Outfit',sans-serif;font-weight:600;font-size:13px;color:rgba(8,32,56,.6);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid rgba(8,32,56,.1);padding-bottom:10px}\n.weather-temps{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}\n.temp-min{font-size:15px;color:var(--muted)}.temp-max{font-family:'Outfit',sans-serif;font-size:36px;font-weight:300;color:var(--dark);letter-spacing:-.02em}.temp-unit{font-size:16px;color:var(--muted)}\n.weather-summary{font-weight:600;font-size:13px;color:var(--dark);margin-bottom:8px}\n.rain-row{display:flex;align-items:center;gap:10px;font-size:12.5px;margin-bottom:4px}\n.rain-bar{flex:1;max-width:100px;height:5px;background:rgba(8,32,56,.12);border-radius:3px;overflow:hidden}\n.rain-fill{height:100%;background:var(--blue-mid);border-radius:3px}\n.rain-mm{font-size:11px;color:var(--muted)}\n.weather-extras{display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px;border-top:1px solid rgba(8,32,56,.08)}\n.weather-extras strong{color:var(--text);font-weight:600}\n.weather-left{}\n.weather-map-wrap{flex-shrink:0;text-align:center}\n.weather-map-wrap img{width:520px;max-width:100%;border-radius:6px;border:1px solid rgba(8,32,56,.12);display:block}\n.map-label{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-top:6px;font-weight:600}\n.map-caption{font-size:11px;color:rgba(8,32,56,.45);margin-top:3px}\n.radio-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}\n.radio-table{width:100%;border-collapse:collapse;font-size:12.5px}\n.radio-table thead th{background:rgba(8,32,56,.06);color:var(--dark);padding:7px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}\n.radio-table td{padding:6px 10px;border-bottom:1px solid rgba(8,32,56,.06)}\n.radio-table td:first-child{font-family:'Outfit',sans-serif;font-weight:600;color:var(--dark);width:30px;text-align:center}\n.wifi-box{background:var(--dark);color:white;border-radius:var(--r);padding:20px 24px;display:grid;grid-template-columns:1fr 1fr;gap:12px 32px}\n.wifi-box h4{grid-column:1/-1;font-family:'Outfit',sans-serif;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin-bottom:4px}\n.wifi-row .wl{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:rgba(213,240,254,.6);margin-bottom:2px}\n.wifi-row .wv{font-family:'Outfit',sans-serif;font-weight:600;color:white}\n.wifi-row .wv.int{color:var(--blue)}\n.contacts-btn{position:fixed;top:18px;right:24px;z-index:600;background:var(--dark);color:var(--blue);border:none;border-radius:8px;padding:9px 18px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:background .2s,transform .15s;box-shadow:0 2px 8px rgba(8,32,56,.25)}.contacts-btn:hover{background:#0d3055;transform:translateY(-1px)}.contacts-backdrop{position:fixed;inset:0;background:rgba(8,32,56,.55);z-index:700;opacity:0;pointer-events:none;transition:opacity .3s ease}.contacts-backdrop.open{opacity:1;pointer-events:all}.contacts-panel{position:fixed;top:0;right:0;width:460px;max-width:100vw;height:100vh;background:var(--white);z-index:800;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .35s cubic-bezier(.4,0,.2,1);box-shadow:-4px 0 32px rgba(8,32,56,.18)}.contacts-panel.open{transform:translateX(0)}.contacts-panel-head{padding:24px 24px 20px;background:var(--dark);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.contacts-panel-head h2{font-family:'Outfit',sans-serif;font-size:18px;font-weight:600;color:var(--blue);letter-spacing:.02em}.contacts-close{background:none;border:none;color:rgba(213,240,254,.6);font-size:26px;line-height:1;cursor:pointer;padding:4px;transition:color .15s}.contacts-close:hover{color:var(--blue)}.contacts-search{padding:14px 16px;border-bottom:1px solid rgba(8,32,56,.08);flex-shrink:0}.contacts-search input{width:100%;border:1px solid rgba(8,32,56,.15);border-radius:6px;padding:8px 12px;font-size:13px;font-family:'DM Sans',sans-serif;outline:none;color:var(--dark);transition:border-color .15s}.contacts-search input:focus{border-color:var(--blue-mid)}.contacts-list{flex:1;overflow-y:auto;padding:12px 0}.contact-card{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid rgba(8,32,56,.06);transition:background .15s}.contact-card:hover{background:rgba(213,240,254,.35)}.contact-avatar{width:38px;height:38px;border-radius:50%;background:var(--blue);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;color:var(--dark)}.contact-info{flex:1;min-width:0}.contact-company{font-family:'Outfit',sans-serif;font-size:13px;font-weight:700;color:var(--dark);line-height:1.3}.contact-name{font-size:12px;color:var(--muted);margin-top:1px}.contact-number{flex-shrink:0;text-align:right}.contact-number a{font-family:'Outfit',sans-serif;font-size:13px;font-weight:600;color:var(--blue-mid);text-decoration:none;white-space:nowrap}.contact-number a:hover{text-decoration:underline}.contact-no-number{font-size:11px;color:rgba(8,32,56,.25);font-style:italic}.contacts-empty{padding:40px 24px;text-align:center;color:var(--muted);font-size:13px}@media(max-width:900px){:root{--nav-w:0px}.sidebar{transform:translateX(-220px);transition:transform .3s ease;width:220px}.sidebar.open{transform:translateX(0)}.ticker{left:0}.mobile-toggle{display:flex;position:fixed;top:12px;left:12px;z-index:200;width:40px;height:40px;background:var(--blue);border-radius:6px;align-items:center;justify-content:center;cursor:pointer;border:none;flex-direction:column;gap:4px;padding:10px}.mobile-toggle span{display:block;width:20px;height:2px;background:var(--dark);border-radius:2px}.day-header,.day-body{padding-left:20px;padding-right:20px}.day-header{padding-top:60px}.weather-card{grid-template-columns:1fr}.weather-map-wrap img{width:100%;max-width:340px}.radio-grid,.wifi-box{grid-template-columns:1fr}}\n@media(min-width:901px){.mobile-toggle{display:none}}\n"
+CSS = "\n:root{--blue:#d5f0fe;--blue-light:rgba(213,240,254,.30);--blue-mid:#1a9bc6;--dark:#082038;--text:rgba(0,0,0,.82);--muted:rgba(0,0,0,.45);--white:#fff;--nav-w:220px;--r:10px;--c-event:#F97316;--c-site:#16A34A;--c-tech:#2563EB;--c-vendor:#D97706;--c-security:#DC2626;--c-theming:#7C3AED;--c-crew:#525252}\n*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:'DM Sans',sans-serif;font-size:14px;color:var(--text);background:var(--white);letter-spacing:.003em;line-height:1.55}\n.ticker{position:fixed;top:0;left:var(--nav-w);right:0;z-index:500;padding:10px 48px 10px 20px;display:flex;align-items:center;gap:12px;font-size:13px;font-weight:500;transition:transform .3s ease}\n.ticker.hidden{transform:translateY(-110%)}\n.ticker-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}\n.ticker-close{position:absolute;right:16px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:20px;line-height:1;opacity:.6;padding:4px}\n.ticker-close:hover{opacity:1}\n.ticker.green{background:#dcfce7;color:#14532d;border-bottom:1px solid #86efac}.ticker.green .ticker-dot{background:#16a34a}\n.ticker.orange{background:#fff7ed;color:#7c2d12;border-bottom:1px solid #fdba74}.ticker.orange .ticker-dot{background:#f97316}\n.ticker.red{background:#fef2f2;color:#7f1d1d;border-bottom:1px solid #fca5a5}.ticker.red .ticker-dot{background:#dc2626}\nbody.has-ticker .main{padding-top:42px}\n.sidebar{position:fixed;top:0;left:0;width:var(--nav-w);height:100vh;background:var(--blue);display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;z-index:100;scrollbar-width:none}\n.sidebar::-webkit-scrollbar{display:none}\n.sidebar-logo{padding:22px 18px 14px;flex-shrink:0}\n.sidebar-logo img{width:62px;height:62px;display:block}\n.sidebar-meta{padding:0 18px 16px;border-bottom:1px solid rgba(8,32,56,.12);flex-shrink:0}\n.sidebar-meta .fn{font-family:'Outfit',sans-serif;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--dark);line-height:1.3;margin-bottom:2px}\n.sidebar-meta .fs{font-size:11px;color:rgba(8,32,56,.55)}\n.day-nav{list-style:none;padding:10px 0 20px;flex:1}\n.day-nav li a{display:block;padding:9px 18px;text-decoration:none;color:rgba(8,32,56,.7);font-size:12px;font-weight:500;line-height:1.3;transition:background .15s;border-left:3px solid transparent;cursor:pointer}\n.day-nav li a .dn{display:block;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;color:var(--dark);line-height:1.2}\n.day-nav li a .dt{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:rgba(8,32,56,.45)}\n.day-nav li a:hover{background:rgba(8,32,56,.07)}\n.day-nav li a.active{background:rgba(8,32,56,.1);border-left-color:var(--dark)}\n.sidebar-footer{padding:14px 18px;border-top:1px solid rgba(8,32,56,.1);font-size:11px;color:rgba(8,32,56,.45);flex-shrink:0}\n.main{margin-left:var(--nav-w);min-height:100vh}\n.day-panel{display:none}.day-panel.active{display:block}\n.day-header{background:var(--blue);padding:36px 48px 28px;border-bottom:1px solid rgba(8,32,56,.08)}\n.day-header .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:rgba(8,32,56,.5);margin-bottom:6px}\n.day-header h1{font-family:'Outfit',sans-serif;font-size:52px;font-weight:300;letter-spacing:-.03em;color:var(--dark);line-height:1;margin-bottom:6px}\n.day-header .dd{font-family:'Outfit',sans-serif;font-size:18px;font-weight:400;color:rgba(8,32,56,.6);letter-spacing:-.01em}\n.day-body{padding:0 48px 60px}\n.ds-section{padding:32px 0 28px;border-bottom:1px solid rgba(8,32,56,.07)}\n.ds-section:last-child{border-bottom:none}\n.section-heading{font-family:'Outfit',sans-serif;font-size:28px;font-weight:300;color:var(--blue-mid);letter-spacing:-.02em;margin-bottom:16px;line-height:1.1}\n.empty-section{color:var(--muted);font-size:13px;font-style:italic}\n.sitemap-toggle{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;background:var(--blue-light);border:1px solid rgba(8,32,56,.1);border-radius:var(--r);padding:12px 16px;margin-top:16px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--dark);transition:background .2s}\n.sitemap-toggle:hover{background:rgba(213,240,254,.6)}\n.sitemap-arrow{font-size:11px;transition:transform .25s;margin-left:auto;color:var(--muted)}\n.sitemap-toggle.open .sitemap-arrow{transform:rotate(180deg)}\n.sitemap-body{display:none;margin-top:8px;border-radius:var(--r);overflow:hidden;border:1px solid rgba(8,32,56,.1)}\n.sitemap-body.open{display:block}\n.sitemap-body embed{display:block;width:100%;height:72vh;border:none}\n.sitemap-fallback{padding:16px;color:var(--muted);font-size:12px;background:#f8f9fa}\n.bullet-list{list-style:none;display:flex;flex-direction:column;gap:8px}\n.bullet-list li{padding-left:22px;position:relative;font-size:14px;line-height:1.55}\n.bullet-list li::before{content:'';position:absolute;left:0;top:9px;width:8px;height:8px;border:1.5px solid var(--dark);border-radius:50%}\n.schedule-wrap{overflow-x:auto;margin-top:4px}\n.schedule-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:780px}\n.schedule-table thead th{background:var(--dark);color:var(--blue);padding:9px 12px;text-align:left;font-family:'Outfit',sans-serif;font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}\n.schedule-table tbody tr{border-bottom:1px solid rgba(8,32,56,.07)}\n.schedule-table tbody tr:nth-child(even){background:rgba(213,240,254,.18)}\n.schedule-table tbody tr:hover{background:rgba(213,240,254,.35)}\n.schedule-table td{padding:8px 12px;vertical-align:top}\n.td-time{font-family:'Outfit',sans-serif;font-weight:600;font-size:13px;color:var(--dark);white-space:nowrap;width:70px}\n.td-num{white-space:nowrap}\n.td-notes{font-size:11.5px;color:var(--muted);font-style:italic}\n.dept-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;color:white}\n.dept-Event{background:var(--c-event)}.dept-Site{background:var(--c-site)}.dept-Technical{background:var(--c-tech)}\n.dept-Vendor{background:var(--c-vendor)}.dept-Security{background:var(--c-security)}.dept-Theming{background:var(--c-theming)}.dept-Crew{background:var(--c-crew)}\n.weather-card{background:var(--blue-light);border:1px solid rgba(8,32,56,.1);border-radius:var(--r);padding:20px 24px;display:grid;grid-template-columns:1fr auto;gap:16px 24px}\n.weather-date-row{grid-column:1/-1;font-family:'Outfit',sans-serif;font-weight:600;font-size:13px;color:rgba(8,32,56,.6);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid rgba(8,32,56,.1);padding-bottom:10px}\n.weather-temps{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}\n.temp-min{font-size:15px;color:var(--muted)}.temp-max{font-family:'Outfit',sans-serif;font-size:36px;font-weight:300;color:var(--dark);letter-spacing:-.02em}.temp-unit{font-size:16px;color:var(--muted)}\n.weather-summary{font-weight:600;font-size:13px;color:var(--dark);margin-bottom:8px}\n.rain-row{display:flex;align-items:center;gap:10px;font-size:12.5px;margin-bottom:4px}\n.rain-bar{flex:1;max-width:100px;height:5px;background:rgba(8,32,56,.12);border-radius:3px;overflow:hidden}\n.rain-fill{height:100%;background:var(--blue-mid);border-radius:3px}\n.rain-mm{font-size:11px;color:var(--muted)}\n.weather-extras{display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px;border-top:1px solid rgba(8,32,56,.08)}\n.weather-extras strong{color:var(--text);font-weight:600}\n.weather-left{}\n.weather-map-wrap{flex-shrink:0;text-align:center}\n.weather-map-wrap img{width:520px;max-width:100%;border-radius:6px;border:1px solid rgba(8,32,56,.12);display:block}\n.map-label{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-top:6px;font-weight:600}\n.map-caption{font-size:11px;color:rgba(8,32,56,.45);margin-top:3px}\n.radio-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}\n.radio-table{width:100%;border-collapse:collapse;font-size:12.5px}\n.radio-table thead th{background:rgba(8,32,56,.06);color:var(--dark);padding:7px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}\n.radio-table td{padding:6px 10px;border-bottom:1px solid rgba(8,32,56,.06)}\n.radio-table td:first-child{font-family:'Outfit',sans-serif;font-weight:600;color:var(--dark);width:30px;text-align:center}\n.wifi-box{background:var(--dark);color:white;border-radius:var(--r);padding:20px 24px;display:grid;grid-template-columns:1fr 1fr;gap:12px 32px}\n.wifi-box h4{grid-column:1/-1;font-family:'Outfit',sans-serif;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin-bottom:4px}\n.wifi-row .wl{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:rgba(213,240,254,.6);margin-bottom:2px}\n.wifi-row .wv{font-family:'Outfit',sans-serif;font-weight:600;color:white}\n.wifi-row .wv.int{color:var(--blue)}\n.contacts-btn{position:fixed;top:18px;right:24px;z-index:600;background:var(--dark);color:var(--blue);border:none;border-radius:8px;padding:9px 18px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:background .2s,transform .15s;box-shadow:0 2px 8px rgba(8,32,56,.25)}.contacts-btn:hover{background:#0d3055;transform:translateY(-1px)}.contacts-backdrop{position:fixed;inset:0;background:rgba(8,32,56,.55);z-index:700;opacity:0;pointer-events:none;transition:opacity .3s ease}.contacts-backdrop.open{opacity:1;pointer-events:all}.contacts-panel{position:fixed;top:0;right:0;width:460px;max-width:100vw;height:100vh;background:var(--white);z-index:800;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .35s cubic-bezier(.4,0,.2,1);box-shadow:-4px 0 32px rgba(8,32,56,.18)}.contacts-panel.open{transform:translateX(0)}.contacts-panel-head{padding:24px 24px 20px;background:var(--dark);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.contacts-panel-head h2{font-family:'Outfit',sans-serif;font-size:18px;font-weight:600;color:var(--blue);letter-spacing:.02em}.contacts-close{background:none;border:none;color:rgba(213,240,254,.6);font-size:26px;line-height:1;cursor:pointer;padding:4px;transition:color .15s}.contacts-close:hover{color:var(--blue)}.contacts-search{padding:14px 16px;border-bottom:1px solid rgba(8,32,56,.08);flex-shrink:0}.contacts-search input{width:100%;border:1px solid rgba(8,32,56,.15);border-radius:6px;padding:8px 12px;font-size:13px;font-family:'DM Sans',sans-serif;outline:none;color:var(--dark);transition:border-color .15s}.contacts-search input:focus{border-color:var(--blue-mid)}.contacts-list{flex:1;overflow-y:auto;padding:12px 0}.contact-card{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid rgba(8,32,56,.06);transition:background .15s}.contact-card:hover{background:rgba(213,240,254,.35)}.contact-avatar{width:38px;height:38px;border-radius:50%;background:var(--blue);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;color:var(--dark)}.contact-info{flex:1;min-width:0}.contact-company{font-family:'Outfit',sans-serif;font-size:13px;font-weight:700;color:var(--dark);line-height:1.3}.contact-name{font-size:12px;color:var(--muted);margin-top:1px}.contact-number{flex-shrink:0;text-align:right}.contact-number a{font-family:'Outfit',sans-serif;font-size:13px;font-weight:600;color:var(--blue-mid);text-decoration:none;white-space:nowrap}.contact-number a:hover{text-decoration:underline}.contact-no-number{font-size:11px;color:rgba(8,32,56,.25);font-style:italic}.contacts-empty{padding:40px 24px;text-align:center;color:var(--muted);font-size:13px}@media(max-width:900px){:root{--nav-w:0px}.sidebar{transform:translateX(-220px);transition:transform .3s ease;width:220px}.sidebar.open{transform:translateX(0)}.ticker{left:0}.mobile-toggle{display:flex;position:fixed;top:12px;left:12px;z-index:200;width:40px;height:40px;background:var(--blue);border-radius:6px;align-items:center;justify-content:center;cursor:pointer;border:none;flex-direction:column;gap:4px;padding:10px}.mobile-toggle span{display:block;width:20px;height:2px;background:var(--dark);border-radius:2px}.day-header,.day-body{padding-left:20px;padding-right:20px}.day-header{padding-top:60px}.weather-card{grid-template-columns:1fr}.weather-map-wrap img{width:100%;max-width:340px}.radio-grid,.wifi-box{grid-template-columns:1fr}}\n@media(min-width:901px){.mobile-toggle{display:none}}\n.wx-card{display:flex;flex-direction:column;gap:14px}\n.wx-headline{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:14px;border-bottom:1px solid rgba(8,32,56,.08)}\n.wx-icon{font-size:36px;line-height:1;flex-shrink:0}\n.wx-desc-wrap{flex:1;min-width:0}\n.wx-desc{display:block;font-family:'Outfit',sans-serif;font-size:19px;font-weight:500;color:var(--dark);line-height:1.2}\n.wx-temps{display:flex;align-items:baseline;gap:8px;margin-top:3px;font-size:14px}\n.wx-tmax{font-family:'Outfit',sans-serif;font-weight:700;font-size:22px;color:var(--dark)}\n.wx-tmin{color:var(--muted);font-size:15px}\n.wx-mm-badge{flex-shrink:0;background:var(--dark);color:var(--blue);font-family:'Outfit',sans-serif;font-size:13px;font-weight:700;padding:5px 12px;border-radius:999px}\n.wx-chart-wrap{border-radius:8px;overflow:hidden;padding:10px 6px 4px;background:rgba(213,240,254,.18);border:1px solid rgba(8,32,56,.06)}\n.wx-advisory{padding:9px 14px;border-radius:6px;font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:8px;line-height:1.4}\n.wx-adv-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}\n.wx-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:2px 16px}\n.wx-stat{padding:9px 0;border-bottom:1px solid rgba(8,32,56,.05)}\n.wx-stat-lbl{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700;margin-bottom:3px}\n.wx-stat-val{font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--dark);line-height:1.3}\n.wx-stat-sub{font-family:'DM Sans',sans-serif;font-weight:400;font-size:12px;color:var(--muted);margin-left:3px}\n@media(max-width:900px){.wx-stats{grid-template-columns:repeat(2,1fr)}}\n"
 JS  = '\nfunction showTicker(text, urgency) {\n  var el = document.getElementById(\'ticker\');\n  if (!text) { hideTicker(); return; }\n  el.className = \'ticker \' + (urgency || \'green\');\n  el.innerHTML = \'<span class="ticker-dot"></span><span class="ticker-text">\' + text + \'</span>\'\n    + \'<button class="ticker-close" onclick="hideTicker()" aria-label="Dismiss">&times;</button>\';\n  document.body.classList.add(\'has-ticker\');\n}\nfunction hideTicker() {\n  document.getElementById(\'ticker\').className = \'ticker hidden\';\n  document.body.classList.remove(\'has-ticker\');\n}\nfunction showDay(idx) {\n  document.querySelectorAll(\'.day-panel\').forEach(function(p){ p.classList.remove(\'active\'); });\n  document.querySelectorAll(\'#day-nav a\').forEach(function(a){ a.classList.remove(\'active\'); });\n  var panel = document.getElementById(\'panel-\' + idx);\n  panel.classList.add(\'active\');\n  document.querySelector(\'#day-nav a[data-day="\' + idx + \'"]\').classList.add(\'active\');\n  window.scrollTo(0,0);\n  document.querySelector(\'.sidebar\').classList.remove(\'open\');\n  if (panel.dataset.tickerActive === \'true\') {\n    showTicker(panel.dataset.tickerText, panel.dataset.tickerUrgency);\n  } else { hideTicker(); }\n}\nfunction toggleSiteMap(btn) {\n  btn.classList.toggle(\'open\');\n  btn.nextElementSibling.classList.toggle(\'open\');\n}\ndocument.addEventListener(\'DOMContentLoaded\',function(){\n  var first=document.getElementById(\'panel-0\');\n  if(first&&first.dataset.tickerActive===\'true\'){\n    showTicker(first.dataset.tickerText,first.dataset.tickerUrgency);\n  }\n});\n'
 
 # ── GENERATE HTML ─────────────────────────────────────────────────────────────
@@ -535,16 +803,14 @@ def main():
     notes_by_day = read_notes_from_excel(wb)
 
     print("  Weather: fetching from Open-Meteo...")
-    weather_by_date = fetch_weather()
-    print("  Maps: fetching Metvuw rainfall images...")
-    maps_by_date = fetch_metvuw_maps(DAYS_META)
+    weather_by_date, hourly_by_date = fetch_weather()
 
     days_data = []
     for meta in DAYS_META:
         events = parse_schedule(wb, meta["sheet"]) if meta["sheet"] in wb.sheetnames else []
         notes  = notes_by_day.get(meta["day"], {})
         idx    = len(days_data)
-        panel  = render_panel(meta, idx, events, notes, weather_by_date, maps_by_date)
+        panel  = render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date)
         days_data.append((meta, panel))
         print(f'  Day {meta["day"]}: {meta["date"]:25s}  {len(events):2d} schedule events')
 
