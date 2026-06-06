@@ -440,14 +440,6 @@ def render_weather(wx, iso, idx, hourly=None):
         if at:
             feels = round(max(at))
 
-    # Advisory bar
-    adv_level, adv_msg = rain_advisory(hourly or [])
-    adv_styles = {
-        'green':  ('background:#dcfce7;color:#14532d;border-left:3px solid #16a34a', '#16a34a'),
-        'orange': ('background:#fff7ed;color:#7c2d12;border-left:3px solid #f97316', '#f97316'),
-        'red':    ('background:#fef2f2;color:#7f1d1d;border-left:3px solid #dc2626', '#dc2626'),
-    }
-    adv_style, adv_dot_col = adv_styles[adv_level]
 
     # Headline
     feels_str = f'&nbsp;&nbsp;Feels {feels}&deg;' if feels else ''
@@ -467,14 +459,6 @@ def render_weather(wx, iso, idx, hourly=None):
     chart_html = ''
     if hourly:
         chart_html = '<div class="wx-chart-wrap">' + render_hourly_chart(hourly) + '</div>'
-
-    # Advisory
-    adv_html = (
-        f'<div class="wx-advisory" style="{adv_style}">'
-        f'<span class="wx-adv-dot" style="background:{adv_dot_col}"></span>'
-        f'<span>{e(adv_msg)}</span>'
-        f'</div>'
-    )
 
     # Stats grid
     def stat(lbl, val):
@@ -498,7 +482,6 @@ def render_weather(wx, iso, idx, hourly=None):
         f'<div class="wx-card">'
         f'{headline}'
         f'{chart_html}'
-        f'{adv_html}'
         f'{stats_html}'
         f'</div>'
     )
