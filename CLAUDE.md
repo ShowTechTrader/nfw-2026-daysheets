@@ -60,7 +60,7 @@ Row 1: title, Row 3: headers, Row 4: day label, Rows 5+: 15-min schedule slots
 | Col | Header | Notes |
 |-----|--------|-------|
 | A | Time | `datetime.time` objects, carry-forward |
-| B | Dept | Event / Site / Technical / Vendor / Security / Theming / Crew |
+| B | Dept | Event / Site / Technical / Vendor / Security / Theming / Crew / Deliveries / Cleaning |
 | C | Activity | Free text |
 | D | Responsibility | Free text |
 | E | Contact | Auto-filled by XLOOKUP from col F |
@@ -78,7 +78,7 @@ Formulas in col E and G:
 
 | Col | Content |
 |-----|---------|
-| A | Departments (Site, Event, Technical, Vendors, Security, Theming, Crew) |
+| A | Departments (Site, Event, Technical, Vendors, Security, Theming, Crew, Deliveries, Cleaning) |
 | C | Contact Name |
 | D | Company ← **dropdown source** for day sheets col F |
 | E | Contact Number |
@@ -172,7 +172,7 @@ The contacts JS is a **separate** `<script>` block at the bottom of the HTML (no
 - Dark navy: `#082038`
 - Mid blue: `#1A9BC6`
 - Fonts: Outfit (headings), DM Sans (body) via Google Fonts
-- Dept badge colours: Event `#F97316` · Site `#16A34A` · Technical `#2563EB` · Vendor `#D97706` · Security `#DC2626` · Theming `#7C3AED` · Crew `#525252`
+- Dept badge colours: Event `#F97316` · Site `#16A34A` · Technical `#2563EB` · Vendor `#D97706` · Security `#DC2626` · Theming `#7C3AED` · Crew `#525252` · Deliveries `#0891B2` · Cleaning `#65A30D`
 
 ---
 
