@@ -83,7 +83,7 @@ Formulas in col E and G:
 | D | Company ← **dropdown source** for day sheets col F |
 | E | Contact Number |
 
-Col F dropdown in day sheets references `'Data Validation Sheet'!$D$2:$D$28` (currently 27 companies).
+Col F dropdown in day sheets references `'Data Validation Sheet'!$D$2:$D$50` (up to 48 companies).
 
 **Important:** Excel/OneDrive strips data validations on save. If dropdowns disappear, re-add them with openpyxl — see the pattern used previously (DataValidation type='list', formula1=that range, showDropDown=False).
 
