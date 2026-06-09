@@ -196,7 +196,57 @@ DAYS_META = [
 
 ## Known issues / things to watch
 
-- **Data validation dropdowns** disappear when Excel is saved via OneDrive. Re-add with openpyxl if needed.
+- **Data validation dropdowns (CRITICAL — openpyxl strips them on every load+save)**
+  
+  openpyxl silently strips Excel's *extended* (x14-namespace) data validations every time it loads and resaves the workbook — even if you never touch those sheets. The Dept (col B) and Company (col F) dropdowns on all 9 day sheets are stored as x14 validations and **will be deleted** by any `openpyxl.load_workbook(…).save(…)` round-trip.
+  
+  **The three dropdowns that must exist on every day sheet (B5:B500, F5:F500, I5:I500):**
+
+  | Column | Range | formula1 | Source |
+  |--------|-------|----------|--------|
+  | B — Dept | `B5:B500` | `'Data Validation Sheet'!$A$2:$A$10` | Dept list |
+  | F — Company | `F5:F500` | `'Data Validation Sheet'!$D$2:$D$50` | Company list |
+  | I — Done tick | `I5:I500` | `"✓"` | Literal value |
+
+  **Rule: after ANY openpyxl save of the master workbook, immediately re-add B and F validations using this pattern:**
+
+  ```python
+  from openpyxl.worksheet.datavalidation import DataValidation
+
+  DAY_SHEETS = [
+      'Monday 8th','Tuesday 9th','Wednesday 10th','Thursday 11th','Friday 12th',
+      'Saturday 13th','Sunday 14th','Monday 15th','Tuesday 16th'
+  ]
+
+  for sheet_name in DAY_SHEETS:
+      ws = wb[sheet_name]
+      dv_dept = DataValidation(
+          type='list',
+          formula1="'Data Validation Sheet'!$A$2:$A$10",
+          showDropDown=False,   # False = show the dropdown arrow
+          allow_blank=True
+      )
+      dv_dept.sqref = 'B5:B500'
+      ws.add_data_validation(dv_dept)
+
+      dv_company = DataValidation(
+          type='list',
+          formula1="'Data Validation Sheet'!$D$2:$D$50",
+          showDropDown=False,
+          allow_blank=True
+      )
+      dv_company.sqref = 'F5:F500'
+      ws.add_data_validation(dv_company)
+
+  wb.save('NFW_Production_Schedule_2026_-_Master.xlsx')
+  ```
+
+  **Why `showDropDown=False`?** openpyxl uses Excel's internal XML attribute name where `False` = show the arrow, `True` = hide it. Counter-intuitive but correct.
+
+  **Why this recurs every run:** When Excel opens a file containing openpyxl-written standard DVs, it converts them to its own x14 extended format on save. The next openpyxl load then strips that x14 block again, wiping B and F for all 9 sheets. This is a permanent cycle — the re-add block above must be included in every script that loads and saves the master workbook. It is NOT enough to add it once.
+
+  The I-column tick validation survives because it is a literal-value DV (`"✓"`) which Excel leaves in the standard namespace. Always verify with `list(ws.data_validations.dataValidation)` after saving if in doubt.
+
 - **Weather fetch** fails in any sandboxed environment — works fine on Keegan's Mac with internet.
 - **Day Sheet Notes offsets** — if you ever change `SECTION_HEIGHT` or any offset, you MUST rebuild the Excel sheet too. They must stay in sync. Run a verification script after any layout change.
 - The `generate_daysheet.py` output mentions `day_notes.json` in its footer print — that's a stale message from an earlier version. Ignore it; the generator reads from Excel only.
