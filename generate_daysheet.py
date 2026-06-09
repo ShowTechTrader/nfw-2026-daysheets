@@ -12,7 +12,7 @@ Requirements:
     pip install openpyxl requests Pillow numpy
 """
 
-import argparse, base64, html, io, json, sys
+import argparse, base64, html, io, json, os, re, sys
 from datetime import date, timedelta, datetime as dt
 from pathlib import Path
 
@@ -515,7 +515,25 @@ def sec(heading, content):
     return f'<div class="ds-section"><h2 class="section-heading">{heading}</h2>{content}</div>'
 
 # ── DAY PANEL ─────────────────────────────────────────────────────────────────
-def render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date=None):
+def _day_video_key(sheet_name):
+    """'Monday 8th' → 'Monday_8'"""
+    parts = sheet_name.split()
+    num = re.sub(r'\D+$', '', parts[1])
+    return f"{parts[0]}_{num}"
+
+def find_videos(videos_dir):
+    """Scan videos/ folder → dict of {key: filename}, e.g. {'Monday_8': 'Monday_8.mp4'}"""
+    result = {}
+    if not os.path.isdir(videos_dir):
+        return result
+    for f in os.listdir(videos_dir):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in ('.mp4', '.mov', '.m4v'):
+            key = os.path.splitext(f)[0]
+            result[key] = f
+    return result
+
+def render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date=None, video_file=None):
     iso = meta["iso"]
     wx  = weather_by_date.get(iso)
     n   = notes
@@ -533,8 +551,24 @@ def render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date=None)
         '<p class="sitemap-fallback">Ensure <code>site-map.pdf</code> is in the same folder as this HTML file.</p>'
         '</div>')
 
+    if video_file:
+        ext = os.path.splitext(video_file)[1].lower()
+        mime = 'video/quicktime' if ext == '.mov' else 'video/mp4'
+        vid_src = 'videos/' + video_file
+        site_video = (
+            '<div class="sitemap-toggle" onclick="toggleSiteMap(this)" style="margin-top:8px">'
+            '<span>&#x1F3A5; Site Video</span><span class="sitemap-arrow">&#x25BC;</span></div>'
+            '<div class="sitemap-body">'
+            f'<video controls style="width:100%;display:block;max-height:72vh;background:#000">'
+            f'<source src="{vid_src}" type="{mime}">'
+            'Your browser does not support video playback.'
+            '</video>'
+            '</div>')
+    else:
+        site_video = ''
+
     parts = []
-    parts.append(f'<div class="ds-section"><h2 class="section-heading">Overview / Key Notes</h2>{bullets(n.get("overview"))}{sitemap}</div>')
+    parts.append(f'<div class="ds-section"><h2 class="section-heading">Overview / Key Notes</h2>{bullets(n.get("overview"))}{sitemap}{site_video}</div>')
     if n.get("changes"):   parts.append(sec("Changes", bullets(n["changes"])))
     if n.get("flags"):     parts.append(sec("Flags",   bullets(n["flags"])))
     parts.append(sec("Schedule", render_schedule(events)))
@@ -972,14 +1006,27 @@ def main():
     print("  Weather: fetching from Open-Meteo...")
     weather_by_date, hourly_by_date = fetch_weather()
 
+    videos_dir = str(excel_path.parent / 'videos')
+    all_videos = find_videos(videos_dir)
+    if all_videos:
+        print(f"  Videos: found {len(all_videos)} — {', '.join(sorted(all_videos))}")
+    else:
+        print("  Videos: none found in videos/ folder")
+
     days_data = []
-    for meta in DAYS_META:
+    for i, meta in enumerate(DAYS_META):
         events = parse_schedule(wb, meta["sheet"]) if meta["sheet"] in wb.sheetnames else []
         notes  = notes_by_day.get(meta["day"], {})
         idx    = len(days_data)
-        panel  = render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date)
+        # Show previous day's video on this panel
+        video_file = None
+        if i > 0:
+            prev_key = _day_video_key(DAYS_META[i - 1]["sheet"])
+            video_file = all_videos.get(prev_key)
+        panel  = render_panel(meta, idx, events, notes, weather_by_date, hourly_by_date, video_file)
         days_data.append((meta, panel))
-        print(f'  Day {meta["day"]}: {meta["date"]:25s}  {len(events):2d} schedule events')
+        vid_note = f'  video: {video_file}' if video_file else ''
+        print(f'  Day {meta["day"]}: {meta["date"]:25s}  {len(events):2d} schedule events{vid_note}')
 
     html_out = generate_html(days_data, logo_b64, dt.now().strftime("%d %b %Y %H:%M"), contacts, shopping_list)
     Path(args.output).write_text(html_out, encoding="utf-8")
